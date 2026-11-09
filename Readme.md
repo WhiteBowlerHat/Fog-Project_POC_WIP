@@ -13,7 +13,7 @@ pip install pillow pycryptodome
 ### Hide a file
 
 ```
-python fog_stego.py hide message.zip bank/ output/
+python fast-fog.py hide message.zip bank/ output/
 ```
 
 - `message.zip`: the file to hide (any type, no need to zip it).
@@ -34,7 +34,7 @@ Options:
 ### Recover a file
 
 ```
-python fog_stego.py extract output/ result/
+python fast-fog.py extract output/ result/
 ```
 
 The file is written as `result/out.<extension>` (for example `out.zip`, `out.mp4`, or just `out` if the original had no extension).
@@ -49,11 +49,17 @@ Options:
 
 ### Python
 
-```python
-from fog_stego import fog, wind
+The hyphen in `fast-fog.py` prevents a plain `import`, so load the file explicitly (or rename it `fast_fog.py` and use `from fast_fog import fog, wind`):
 
-nbytes, nonce = fog("my key", "message.zip", "bank", "output")   # hide
-path = wind("my key", "output", "result")                        # recover
+```python
+import importlib.util
+
+spec = importlib.util.spec_from_file_location("fast_fog", "fast-fog.py")
+fast_fog = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fast_fog)
+
+nbytes, nonce = fast_fog.fog("my key", "message.zip", "bank", "output")   # hide
+path = fast_fog.wind("my key", "output", "result")                        # recover
 ```
 
 `fog(key, message, image_bank, destination, extension=None, store_nonce=True)` returns the number of embedded bytes and the nonce (base64).
