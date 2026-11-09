@@ -3,20 +3,25 @@
 
 Protocol (bit stream, MSB first, read in the keyed pseudo-random pixel order)
 ---------------------------------------------------------------------------
-    [flag: 1 bit] [file type] [message size] [tag: 16 bytes] [data]
+    [flag: 1 bit] [file type] [file name] [message size] [tag: 16 bytes] [data]
 
 File type
     flag = 0 (standard)      -> extension is exactly 3 bytes:        EEE
     flag = 1 (non-standard)  -> letter | ext length (ASCII digits) | letter | ext bytes
     (no extension at all is non-standard with length "0")
 
+File name (without the extension, always present)
+    letter | name length (ASCII digits) | letter | name bytes
+    (length "0" if empty; the receiver then falls back to "out")
+
 Message size (in bytes, always present)
     letter | size (ASCII digits) | letter
 
 The delimiter letters are random [a-z]; digits are [0-9], so a field's end is
-unambiguous. Tag = HMAC-SHA256(flag, ext, data) truncated to 16 bytes: it tells
-a wrong key / altered images apart from valid data, and covers the type and
-size too. Readers cap the number of digits so garbage can't run on forever.
+unambiguous. Tag = HMAC-SHA256(flag, ext, name, data) truncated to 16 bytes: it
+tells a wrong key / altered images apart from valid data, and covers the type,
+name and size too. Readers cap the number of digits so garbage can't run on
+forever.
 
 Keys and image order
     * scrypt(passphrase, salt = nonce) -> XChaCha20 key + HMAC key.
@@ -30,10 +35,10 @@ Keys and image order
       --no-nonce-metadata, keep the printed nonce, and give it back with --nonce.
 
 Usage
-    python fog_stego.py hide    secret.mp4 bank_dir out_dir  [--key K] [--ext EXT]
-                                                             [--no-nonce-metadata]
-    python fog_stego.py extract out_dir result_dir           [--key K] [--nonce B64]
-                                                             [--output-name out]
+    python fastfog.py hide    secret.mp4 bank_dir out_dir
+                              [--key K] [--name NAME] [--ext EXT] [--no-nonce-metadata]
+    python fastfog.py extract out_dir result_dir
+                              [--key K] [--nonce B64] [--output-name NAME]
 
 LSB data does not survive JPEG conversion, resizing or lossy re-encoding.
 """
@@ -61,6 +66,7 @@ STD_EXT_LEN = 3           # "standard" extension length in bytes
 MAX_EXT_BYTES = 255       # file-name limit on common file systems
 EXT_LEN_DIGITS = 3        # max digits in the extension-length field
 SIZE_DIGITS = 15          # max digits in the message-size field
+MAX_NAME_BYTES = 255      # max length of the stored file name (without extension)
 NONCE_KEY = "Nonce"
 
 _BAD_MSG = ("no valid hidden data found: wrong key, wrong image set, "
@@ -213,20 +219,38 @@ def _extension_bytes(ext: str) -> bytes:
     return raw
 
 
-def _mac(mac_key: bytes, flag: int, ext: bytes, data: bytes) -> bytes:
-    msg = struct.pack(">BHQ", flag, len(ext), len(data)) + ext + data
+def _clean_name(name: str) -> str:
+    """Replace characters that are invalid in file names (used when hiding)."""
+    return "".join("_" if (c in _BAD_EXT_CHARS or ord(c) < 32) else c for c in name)
+
+
+def _name_bytes(name: str, ext_len: int) -> bytes:
+    """Validate a file name (without extension) and return its UTF-8 bytes."""
+    if name in (".", "..") or any(c in _BAD_EXT_CHARS or ord(c) < 32 for c in name):
+        raise ValueError(f"invalid file name {name!r}")
+    raw = name.encode("utf-8")
+    if len(raw) + (ext_len + 1 if ext_len else 0) > MAX_NAME_BYTES:
+        raise ValueError(f"file name longer than {MAX_NAME_BYTES} bytes")
+    return raw
+
+
+def _mac(mac_key: bytes, flag: int, ext: bytes, name: bytes, data: bytes) -> bytes:
+    msg = struct.pack(">BHHQ", flag, len(ext), len(name), len(data)) + ext + name + data
     return hmac.new(mac_key, msg, hashlib.sha256).digest()[:TAG_LEN]
 
 
-def build_payload(ext: str, data: bytes, mac_key: bytes):
+def build_payload(ext: str, name: str, data: bytes, mac_key: bytes):
     """Return (flag, body): flag is the 1-bit standard indicator, body the bytes after it."""
     ext_b = _extension_bytes(ext)
+    name_b = _name_bytes(name, len(ext_b))
     flag = 0 if len(ext_b) == STD_EXT_LEN else 1
-    tag = _mac(mac_key, flag, ext_b, data)
+    tag = _mac(mac_key, flag, ext_b, name_b, data)
     parts = []
     if flag:
         parts += [_letter(), str(len(ext_b)).encode("ascii"), _letter()]
-    parts += [ext_b, _letter(), str(len(data)).encode("ascii"), _letter(), tag, data]
+    parts += [ext_b,
+              _letter(), str(len(name_b)).encode("ascii"), _letter(), name_b,
+              _letter(), str(len(data)).encode("ascii"), _letter(), tag, data]
     return flag, b"".join(parts)
 
 
@@ -282,7 +306,7 @@ def _read_field(r: _BitReader, max_digits: int) -> int:
 
 
 def parse_payload(r: _BitReader, mac_key: bytes):
-    """Read and authenticate the payload. Returns (extension str, data bytes)."""
+    """Read and authenticate the payload. Returns (extension, name, data)."""
     flag = r.bit()
     if flag:
         ext_len = _read_field(r, EXT_LEN_DIGITS)
@@ -291,27 +315,35 @@ def parse_payload(r: _BitReader, mac_key: bytes):
     else:
         ext_len = STD_EXT_LEN
     ext_b = r.take(ext_len)
+    name_len = _read_field(r, EXT_LEN_DIGITS)
+    if name_len > MAX_NAME_BYTES:
+        raise HiddenDataError(_BAD_MSG)
+    name_b = r.take(name_len)
     size = _read_field(r, SIZE_DIGITS)
     tag = r.take(TAG_LEN)
     data = r.take(size)
-    if not hmac.compare_digest(tag, _mac(mac_key, flag, ext_b, data)):
+    if not hmac.compare_digest(tag, _mac(mac_key, flag, ext_b, name_b, data)):
         raise HiddenDataError(_BAD_MSG)
     try:
         ext = ext_b.decode("utf-8")
         _extension_bytes(ext)
+        name = name_b.decode("utf-8")
+        _name_bytes(name, len(ext_b))
     except ValueError:
-        raise ValueError("the hidden file type contains invalid characters") from None
-    return ext, data
+        raise ValueError("the hidden file name or type contains invalid characters") from None
+    return ext, name, data
 
 
 # --------------------------------------------------------------------------
 # Hide
 # --------------------------------------------------------------------------
 def fog(key: str, message: str, image_bank: str, destination_folder: str,
-        extension: str = None, store_nonce: bool = True):
+        extension: str = None, store_nonce: bool = True, name: str = None):
     """Hide the file `message` in the PNGs of `image_bank`, write them to `destination_folder`.
 
-    `extension` (without dot) overrides the one taken from the file name.
+    The file name and extension are taken from `message` and stored in the hidden
+    data. `extension` (without dot) and `name` (without extension) override them;
+    characters invalid in file names are replaced by "_".
     Returns (embedded_bytes, nonce_base64).
     """
     if os.path.realpath(image_bank) == os.path.realpath(destination_folder):
@@ -326,13 +358,15 @@ def fog(key: str, message: str, image_bank: str, destination_folder: str,
 
     with open(message, "rb") as fh:
         data = fh.read()
+    stem, dot_ext = os.path.splitext(os.path.basename(message))
     if extension is None:
-        extension = os.path.splitext(message)[1][1:]
+        extension = dot_ext[1:]
     extension = extension.lstrip(".")
+    name = _clean_name(stem if name is None else name)
 
     nonce = get_random_bytes(NONCE_LEN)
     cipher_key, mac_key = derive_keys(key, nonce)
-    flag, body = build_payload(extension, data, mac_key)
+    flag, body = build_payload(extension, name, data, mac_key)
 
     nbits = 1 + 8 * len(body)
     if nbits > imgset.total:
@@ -359,11 +393,30 @@ def fog(key: str, message: str, image_bank: str, destination_folder: str,
 # --------------------------------------------------------------------------
 # Extract
 # --------------------------------------------------------------------------
+def _write_unique(path: str, data: bytes) -> str:
+    """Write `data` to `path`, or to `name (1).ext`, `name (2).ext`... if it exists.
+
+    Never overwrites an existing file. Returns the path actually used.
+    """
+    root, ext = os.path.splitext(path)
+    candidate, i = path, 0
+    while True:
+        try:
+            with open(candidate, "xb") as fh:
+                fh.write(data)
+            return candidate
+        except FileExistsError:
+            i += 1
+            candidate = f"{root} ({i}){ext}"
+
+
 def wind(key: str, directory: str, outputdirectory: str,
-         output_name: str = "out", nonce: str = None) -> str:
+         output_name: str = None, nonce: str = None) -> str:
     """Recover the hidden file from the PNGs in `directory`.
 
-    The file is written as `<output_name>.<extension>` (no dot if it had none).
+    The file is written with its original name and extension. `output_name`
+    (without extension) replaces the original name; if no name was stored, "out"
+    is used. An existing file is never overwritten: a number is added instead.
     `nonce` (base64) is only needed when the metadata was stripped or not stored.
     Returns the output path.
     """
@@ -392,14 +445,12 @@ def wind(key: str, directory: str, outputdirectory: str,
 
     cipher_key, mac_key = derive_keys(key, nonce_b)
     positions = position_stream(Keystream(cipher_key, nonce_b), imgset.total)
-    ext, data = parse_payload(_BitReader(imgset, positions), mac_key)
+    ext, name, data = parse_payload(_BitReader(imgset, positions), mac_key)
 
     os.makedirs(outputdirectory, exist_ok=True)
-    name = output_name + ("." + ext if ext else "")
-    out_path = os.path.join(outputdirectory, name)
-    with open(out_path, "wb") as fh:
-        fh.write(data)
-    return out_path
+    base = output_name if output_name is not None else (name or "out")
+    filename = base + ("." + ext if ext else "")
+    return _write_unique(os.path.join(outputdirectory, filename), data)
 
 
 # --------------------------------------------------------------------------
@@ -414,6 +465,7 @@ def main(argv=None):
     h.add_argument("image_bank")
     h.add_argument("destination")
     h.add_argument("--key")
+    h.add_argument("--name", help="file name (without extension) to record (default: from the file)")
     h.add_argument("--ext", help="file extension to record (default: from the file name)")
     h.add_argument("--no-nonce-metadata", action="store_true",
                    help="do not write the nonce into the PNGs (it is printed instead)")
@@ -421,8 +473,8 @@ def main(argv=None):
     e = sub.add_parser("extract", help="recover the hidden file")
     e.add_argument("directory")
     e.add_argument("output_directory")
-    e.add_argument("--output-name", default="out",
-                   help="base name of the recovered file (extension is added)")
+    e.add_argument("--output-name",
+                   help="name (without extension) to use instead of the original file name")
     e.add_argument("--nonce", help="base64 nonce, if the metadata was stripped")
     e.add_argument("--key")
 
@@ -432,7 +484,8 @@ def main(argv=None):
     try:
         if args.cmd == "hide":
             n, snonce = fog(key, args.message, args.image_bank, args.destination,
-                            extension=args.ext, store_nonce=not args.no_nonce_metadata)
+                            extension=args.ext, store_nonce=not args.no_nonce_metadata,
+                            name=args.name)
             print(f"Hidden {n} bytes (including header) in {args.destination}/")
             if args.no_nonce_metadata:
                 print(f"Nonce (keep it, needed to extract): {snonce}")
