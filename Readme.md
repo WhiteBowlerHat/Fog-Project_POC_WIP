@@ -1,78 +1,138 @@
 # Fog-project
-## Usage :
-First install the required libraries :
 
-pip install requirement.txt
+Hide **any file** (zip, txt, mp4, ...) inside a bank of PNG images, at secret, key-dependent pseudo-random positions.
 
-Then run the program as follow :
+## Installation
 
-python app.py
+```
+pip install pillow pycryptodome
+```
 
-To encrypt :
-- put the key (password) in the key field
-- compress the message in a zip file and put it in the zipfile field
-- put the bank of image that you want to hide your message in the input field (ex: bank, bank2)
-- put your desired output folder in the output field
+## Usage
 
-Then send the image contained in the output folder and the message length (in terminal) to the receiver 
+### Hide a file
 
-To decrypt :
-- put the key (password) in the key field
-- put the message length in the size field
-- put the image fold (where the message is encoded) in the input field
-- put the desired output folder where your decoded zipfile will be generated
+```
+python fog_stego.py hide message.zip bank/ output/
+```
 
-/!\ Warning /!\ 
-This program will work only with the same amount of images, if there is others, it will try to decode with others
+- `message.zip`: the file to hide (any type, no need to zip it).
+- `bank/`: folder containing the `.png` images used as cover. Every image must be different from the others.
+- `output/`: folder where the new images are written (it must differ from the bank).
+- The key (password) is asked at the prompt, or given with `--key`.
 
-/!\ Warning /!\ 
-This program is very light and may be very slow (like hours if the message is big), small lines are preffered
+Then send **all the images of the output folder** to the receiver, and give them the key through another channel. The message length no longer needs to be sent: it is stored inside the hidden data.
 
-/!\ Warning /!\ 
-You can send all the images through different means of communications they have to stay in png and not compress, you might lose information
+Options:
+
+| Option | Effect |
+|-|-|
+| `--key KEY` | Give the key on the command line instead of the prompt |
+| `--ext EXT` | Record this extension instead of the one in the file name |
+| `--no-nonce-metadata` | Do not write the nonce in the PNG metadata; it is printed instead (see below) |
+
+### Recover a file
+
+```
+python fog_stego.py extract output/ result/
+```
+
+The file is written as `result/out.<extension>` (for example `out.zip`, `out.mp4`, or just `out` if the original had no extension).
+
+Options:
+
+| Option | Effect |
+|-|-|
+| `--key KEY` | Give the key on the command line instead of the prompt |
+| `--nonce B64` | Nonce to use when the metadata was stripped or not stored |
+| `--output-name NAME` | Base name of the recovered file (default: `out`) |
+
+### Python
+
+```python
+from fog_stego import fog, wind
+
+nbytes, nonce = fog("my key", "message.zip", "bank", "output")   # hide
+path = wind("my key", "output", "result")                        # recover
+```
+
+`fog(key, message, image_bank, destination, extension=None, store_nonce=True)` returns the number of embedded bytes and the nonce (base64).
+`wind(key, directory, outputdirectory, output_name="out", nonce=None)` returns the path of the recovered file.
+
+## Warnings
+
+- **Use exactly the images that were produced.** The folder given to `extract` must contain only those PNGs. A missing or extra image gives an error (`no valid hidden data found`). File names and listing order do not matter, so renaming files is fine.
+- **Images must stay lossless PNG and unmodified.** JPEG conversion, resizing, screenshots, filters or re-compression destroy the data. The program detects it and refuses to output a corrupted file.
+- **Metadata can be stripped by some platforms** (messengers, social networks). If that is a risk, hide with `--no-nonce-metadata`, keep the printed nonce, and give it to `extract` with `--nonce`. Without the nonce the message cannot be recovered.
+- **Capacity is 1 bit per pixel**, minus a fixed overhead of a little over 22 bytes (type, size, authentication tag). The program stops with an error if the message does not fit.
+- **Choose a long passphrase.** The key is the only secret.
 
 ## Objectives
-The goal of this project is to encrypt/hide a zip file (small) into a bank of images
 
-The program has two main functions :
-- fog : hide the message
-- wind : uncover the message
+The goal of this project is to hide a file of any type into a bank of images, so that it can only be found with the key.
 
-## How does it work ?
-First it use Chacha20 to create a pseudo-random number generator.
+The program has two main functions:
+- `fog`: hide the message
+- `wind`: uncover the message
 
-This generator will be use to get the same pseudo-random numbers when the same key is entered
+## How does it work?
 
-The program need a bank of image to run (png)
+### 1. Keys
 
-Secondly, it convert the zip folder (message you want to hide) in a binary string
+A random 24-byte nonce is drawn. The key is stretched with scrypt (salt = nonce) into 64 bytes: 32 bytes for XChaCha20 and 32 bytes for an HMAC.
 
-Once you have the binary string it iterates through the string, for each bit, it chooses a random image in the bank and then a random pixel to be encoded in. (the R part of RGB)
+### 2. Image order
 
-The meta-data of thye image is then set with a nonce and the image number in order to be able to decode everything
+Images are sorted by the SHA-256 of their pixel data with the red least-significant bits cleared. Embedding does not change this value, so the receiver gets the same order without needing file names or metadata. All images are then seen as one long run of pixels.
 
-Once the program has terminated, a size will be displayed and the new set of images will be generated with the message included. 
+### 3. What is hidden
 
-Send the size of the message and the bank of image to the receiver.
+The hidden data is a bit stream:
 
-With those information you can decode everything
+```
+[flag: 1 bit] [file type] [message size] [tag: 16 bytes] [data]
+```
 
-## Why ? 
-I think it is an interesting mean of obfuscation, and very hard to decode since the algorithm of pseudo-random number is cryptographically secure.
+| Field | Content |
+|-|-|
+| Flag | `0` = standard (extension is exactly 3 bytes), `1` = non-standard |
+| File type, standard | The 3 extension bytes |
+| File type, non-standard | letter, extension length (ASCII digits), letter, then the extension bytes |
+| Message size | letter, size in bytes (ASCII digits), letter |
+| Tag | HMAC-SHA256 of flag, extension and data, truncated to 16 bytes |
+| Data | The file content |
 
-It is between encryption and obfuscation, the message not encrypted but hidden securely.
+The delimiter letters are random `a-z`, digits are `0-9`, so each field ends unambiguously. A file with no extension is non-standard with length `0`. The extension is the text after the last dot (`a.tar.gz` is stored as `gz`), at most 255 bytes.
 
-If you dont have the key, the information is flooded in the bank of image.
+### 4. Where it is hidden
 
-The information you have if you try to decode without the key are :
+The XChaCha20 keystream drives a partial Fisher-Yates shuffle over all the pixels of all the images. This gives a secret sequence of distinct positions, so no two bits ever share a pixel. Bit number *i* of the stream goes into the red least-significant bit of the pixel at position number *i*. Nothing else in the images changes.
 
-- "eventually" the size of the message
-- "eventually" the order of the images
-- the nonce
+The j-th position does not depend on the message length, so the receiver can read the header first, learn the size, then read exactly the rest.
 
-I think the best way to decrypt the message is to find/guess the key, else it will be impossible. 
+### 5. The nonce
 
+By default the nonce is stored in each PNG as a `Nonce` text chunk. With `--no-nonce-metadata` it is only printed.
 
+### 6. Recovering
 
+The receiver rebuilds the same image order, the same keys and the same positions, reads the bits, then recomputes the HMAC. If it does not match (wrong key, wrong or incomplete images, modified images), the program stops with an error instead of writing a corrupted file.
 
+## Why?
 
+I think it is an interesting means of obfuscation: positions come from a cryptographically secure pseudo-random generator, so without the key the information is simply lost in the bank of images.
+
+It sits between encryption and obfuscation: the message itself is not encrypted, but it is hidden at secret positions and authenticated.
+
+What someone can see without the key:
+- the nonce, if it is stored in the metadata (it is not secret and does not help without the key)
+- the set of images
+
+The size, the file type and the image order are not stored in the metadata any more; they are inside the hidden data or derived from the pixels.
+
+The best way to recover the message is to find or guess the key. Otherwise it is out of reach.
+
+### Limits
+
+- This is classic LSB steganography: statistical analysis of the images can reveal that they were modified, even without knowing where.
+- The hidden bits are not encrypted. Their confidentiality rests on the secrecy of the positions.
