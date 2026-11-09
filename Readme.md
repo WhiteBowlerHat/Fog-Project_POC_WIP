@@ -13,7 +13,7 @@ pip install pillow pycryptodome
 ### Hide a file
 
 ```
-python fast-fog.py hide message.zip bank/ output/
+python fastfog.py hide message.zip bank/ output/
 ```
 
 - `message.zip`: the file to hide (any type, no need to zip it).
@@ -34,7 +34,7 @@ Options:
 ### Recover a file
 
 ```
-python fast-fog.py extract output/ result/
+python fastfog.py extract output/ result/
 ```
 
 The file is written as `result/out.<extension>` (for example `out.zip`, `out.mp4`, or just `out` if the original had no extension).
@@ -49,12 +49,12 @@ Options:
 
 ### Python
 
-The hyphen in `fast-fog.py` prevents a plain `import`, so load the file explicitly (or rename it `fast_fog.py` and use `from fast_fog import fog, wind`):
+The hyphen in `fastfog.py` prevents a plain `import`, so load the file explicitly (or rename it `fast_fog.py` and use `from fast_fog import fog, wind`):
 
 ```python
 import importlib.util
 
-spec = importlib.util.spec_from_file_location("fast_fog", "fast-fog.py")
+spec = importlib.util.spec_from_file_location("fast_fog", "fastfog.py")
 fast_fog = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fast_fog)
 
