@@ -1,262 +1,450 @@
-from unicodedata import name
-from PIL import Image
-from PIL.PngImagePlugin import PngImageFile, PngInfo
+#!/usr/bin/env python3
+"""Hide any file in the red-channel LSBs of a set of PNG images.
+
+Protocol (bit stream, MSB first, read in the keyed pseudo-random pixel order)
+---------------------------------------------------------------------------
+    [flag: 1 bit] [file type] [message size] [tag: 16 bytes] [data]
+
+File type
+    flag = 0 (standard)      -> extension is exactly 3 bytes:        EEE
+    flag = 1 (non-standard)  -> letter | ext length (ASCII digits) | letter | ext bytes
+    (no extension at all is non-standard with length "0")
+
+Message size (in bytes, always present)
+    letter | size (ASCII digits) | letter
+
+The delimiter letters are random [a-z]; digits are [0-9], so a field's end is
+unambiguous. Tag = HMAC-SHA256(flag, ext, data) truncated to 16 bytes: it tells
+a wrong key / altered images apart from valid data, and covers the type and
+size too. Readers cap the number of digits so garbage can't run on forever.
+
+Keys and image order
+    * scrypt(passphrase, salt = nonce) -> XChaCha20 key + HMAC key.
+    * The XChaCha20 keystream drives a partial Fisher-Yates shuffle over *all*
+      pixels of *all* images: unique, secret positions, one bit per pixel.
+    * Images are put in a canonical order by the SHA-256 of their pixel data
+      with the red LSBs cleared (embedding does not change it). File names and
+      metadata order are irrelevant; renamed or shuffled files still work.
+    * The 192-bit nonce is stored in a "Nonce" PNG text chunk. It is not secret
+      (only unique). If a platform strips metadata, hide with
+      --no-nonce-metadata, keep the printed nonce, and give it back with --nonce.
+
+Usage
+    python fog_stego.py hide    secret.mp4 bank_dir out_dir  [--key K] [--ext EXT]
+                                                             [--no-nonce-metadata]
+    python fog_stego.py extract out_dir result_dir           [--key K] [--nonce B64]
+                                                             [--output-name out]
+
+LSB data does not survive JPEG conversion, resizing or lossy re-encoding.
+"""
+import argparse
+import base64
+import binascii
+import bisect
+import getpass
 import glob
 import hashlib
+import hmac
+import os
+import secrets
+import struct
+import sys
+
 from Crypto.Cipher import ChaCha20
-from base64 import b64encode, b64decode
 from Crypto.Random import get_random_bytes
-import base64
-import zipfile
-import io
+from PIL import Image
+from PIL.PngImagePlugin import PngInfo
+
+NONCE_LEN = 24            # 192-bit nonce -> XChaCha20
+TAG_LEN = 16              # truncated HMAC-SHA256
+STD_EXT_LEN = 3           # "standard" extension length in bytes
+MAX_EXT_BYTES = 255       # file-name limit on common file systems
+EXT_LEN_DIGITS = 3        # max digits in the extension-length field
+SIZE_DIGITS = 15          # max digits in the message-size field
+NONCE_KEY = "Nonce"
+
+_BAD_MSG = ("no valid hidden data found: wrong key, wrong image set, "
+            "or the images were modified/re-encoded")
+_BAD_EXT_CHARS = set('/\\:*?"<>|')
 
 
+class HiddenDataError(ValueError):
+    """Raised when nothing valid can be read with this key and image set."""
 
-# Function used for safe randomization
-# Taken here -> https://stackoverflow.com/questions/66528995/cryptographically-secure-pseudo-random-shuffle-a-list-or-array-in-python
-def sample(max,cipher,zerobuf):
-    stream_size = (max.bit_length() + 2 + 7) // 8
-    max_stream_value = 1 << (stream_size * 8)
-    max_candidate = max_stream_value - max_stream_value % max
+
+# --------------------------------------------------------------------------
+# Keys and keystream-driven RNG
+# --------------------------------------------------------------------------
+def derive_keys(passphrase: str, nonce: bytes):
+    """Return (cipher_key, mac_key), 32 bytes each."""
+    dk = hashlib.scrypt(passphrase.encode("utf-8"), salt=nonce,
+                        n=2 ** 14, r=8, p=1, dklen=64)
+    return dk[:32], dk[32:]
+
+
+class Keystream:
+    """Deterministic RNG on top of the XChaCha20 keystream (buffered)."""
+
+    CHUNK = 1 << 16
+
+    def __init__(self, key: bytes, nonce: bytes):
+        self._cipher = ChaCha20.new(key=key, nonce=nonce)
+        self._buf = b""
+        self._pos = 0
+
+    def _take(self, n: int) -> bytes:
+        if len(self._buf) - self._pos < n:
+            self._buf = self._buf[self._pos:] + self._cipher.encrypt(bytes(self.CHUNK))
+            self._pos = 0
+        out = self._buf[self._pos:self._pos + n]
+        self._pos += n
+        return out
+
+    def randbelow(self, n: int) -> int:
+        """Uniform integer in [0, n) via rejection sampling (no modulo bias)."""
+        if n < 1:
+            raise ValueError("n must be >= 1")
+        nbytes = (n.bit_length() + 7) // 8 + 1
+        limit = (256 ** nbytes // n) * n
+        while True:
+            v = int.from_bytes(self._take(nbytes), "big")
+            if v < limit:
+                return v % n
+
+
+def position_stream(rng: Keystream, total: int):
+    """Yield distinct positions in [0, total) in secret random order.
+
+    Lazy, sparse partial Fisher-Yates: the j-th output depends only on the key
+    and j, never on the message length, so headers can be read first.
+    """
+    swapped = {}
+    for j in range(total):
+        r = j + rng.randbelow(total - j)
+        vj = swapped.get(j, j)
+        vr = swapped.get(r, r)
+        swapped[r] = vj          # index j is never read again
+        swapped.pop(j, None)
+        yield vr
+
+
+# --------------------------------------------------------------------------
+# Images
+# --------------------------------------------------------------------------
+def _normalize(img: Image.Image) -> Image.Image:
+    """Make sure pixels are RGB/RGBA tuples (palette / grey images get converted)."""
+    if img.mode in ("RGB", "RGBA"):
+        img.load()
+        return img
+    has_alpha = img.mode in ("LA", "PA") or "transparency" in img.info
+    return img.convert("RGBA" if has_alpha else "RGB")
+
+
+_CLEAR_LSB = bytes(v & 0xFE for v in range(256))
+
+
+def _fingerprint(img: Image.Image) -> bytes:
+    """SHA-256 of the pixel data with every red LSB cleared (embedding-invariant)."""
+    n = len(img.getbands())
+    buf = bytearray(img.tobytes())
+    buf[0::n] = buf[0::n].translate(_CLEAR_LSB)
+    h = hashlib.sha256()
+    h.update(f"{img.mode}:{img.size[0]}x{img.size[1]}".encode("ascii"))
+    h.update(buf)
+    return h.digest()
+
+
+def _canonical_order(images):
+    """Indices of `images` sorted by fingerprint; identical images are rejected."""
+    prints = [_fingerprint(im) for im in images]
+    if len(set(prints)) != len(prints):
+        raise ValueError("two images are identical (ignoring the red LSB); "
+                         "every image in the set must be unique")
+    return sorted(range(len(images)), key=lambda i: prints[i])
+
+
+class ImageSet:
+    """Images viewed as one long run of pixels, 1 bit per pixel."""
+
+    def __init__(self, images):
+        self.images = images
+        self.px = [im.load() for im in images]
+        self.starts = []
+        total = 0
+        for im in images:
+            self.starts.append(total)
+            total += im.size[0] * im.size[1]
+        self.total = total
+
+    def locate(self, idx: int):
+        k = bisect.bisect_right(self.starts, idx) - 1
+        w = self.images[k].size[0]
+        off = idx - self.starts[k]
+        return k, off % w, off // w
+
+    def write_bit(self, idx: int, bit: int):
+        k, x, y = self.locate(idx)
+        p = self.px[k][x, y]
+        self.px[k][x, y] = ((p[0] & ~1) | bit,) + tuple(p[1:])
+
+    def read_bit(self, idx: int) -> int:
+        k, x, y = self.locate(idx)
+        return self.px[k][x, y][0] & 1
+
+
+# --------------------------------------------------------------------------
+# Protocol: building and parsing the bit stream
+# --------------------------------------------------------------------------
+def _letter() -> bytes:
+    return bytes([ord("a") + secrets.randbelow(26)])
+
+
+def _is_letter(b: int) -> bool:
+    return 0x61 <= b <= 0x7A
+
+
+def _extension_bytes(ext: str) -> bytes:
+    """Validate an extension (no dot) and return its UTF-8 bytes."""
+    if any(c in _BAD_EXT_CHARS or ord(c) < 32 for c in ext):
+        raise ValueError(f"invalid character in file extension {ext!r}")
+    raw = ext.encode("utf-8")
+    if len(raw) > MAX_EXT_BYTES:
+        raise ValueError(f"file extension longer than {MAX_EXT_BYTES} bytes")
+    return raw
+
+
+def _mac(mac_key: bytes, flag: int, ext: bytes, data: bytes) -> bytes:
+    msg = struct.pack(">BHQ", flag, len(ext), len(data)) + ext + data
+    return hmac.new(mac_key, msg, hashlib.sha256).digest()[:TAG_LEN]
+
+
+def build_payload(ext: str, data: bytes, mac_key: bytes):
+    """Return (flag, body): flag is the 1-bit standard indicator, body the bytes after it."""
+    ext_b = _extension_bytes(ext)
+    flag = 0 if len(ext_b) == STD_EXT_LEN else 1
+    tag = _mac(mac_key, flag, ext_b, data)
+    parts = []
+    if flag:
+        parts += [_letter(), str(len(ext_b)).encode("ascii"), _letter()]
+    parts += [ext_b, _letter(), str(len(data)).encode("ascii"), _letter(), tag, data]
+    return flag, b"".join(parts)
+
+
+def payload_bits(flag: int, body: bytes):
+    yield flag
+    for byte in body:
+        for shift in range(7, -1, -1):
+            yield (byte >> shift) & 1
+
+
+class _BitReader:
+    def __init__(self, imgset: ImageSet, positions):
+        self._set = imgset
+        self._pos = positions
+        self.remaining = imgset.total
+
+    def bit(self) -> int:
+        if self.remaining <= 0:
+            raise HiddenDataError(_BAD_MSG)
+        self.remaining -= 1
+        return self._set.read_bit(next(self._pos))
+
+    def byte(self) -> int:
+        v = 0
+        for _ in range(8):
+            v = (v << 1) | self.bit()
+        return v
+
+    def take(self, n: int) -> bytes:
+        if n * 8 > self.remaining:
+            raise HiddenDataError(_BAD_MSG)
+        return bytes(self.byte() for _ in range(n))
+
+
+def _read_field(r: _BitReader, max_digits: int) -> int:
+    """letter | ASCII digits | letter  ->  the integer."""
+    if not _is_letter(r.byte()):
+        raise HiddenDataError(_BAD_MSG)
+    digits = bytearray()
     while True:
-        stream = cipher.encrypt(zerobuf[0:stream_size])
-        candidate = int.from_bytes(stream, "big")
-        if (candidate < max_candidate):
+        b = r.byte()
+        if 0x30 <= b <= 0x39:
+            digits.append(b)
+            if len(digits) > max_digits:
+                raise HiddenDataError(_BAD_MSG)
+        elif _is_letter(b):
             break
-    return candidate % max
+        else:
+            raise HiddenDataError(_BAD_MSG)
+    if not digits:
+        raise HiddenDataError(_BAD_MSG)
+    return int(digits)
 
-# Function that return an array (size "size") of "random" number between 0 - nb
-def safe_randrange(nb,size,cipher):
-    zerobuf = bytes([0x00]) * 5
-    array = []
-    for i in range(size):
-        print("Number "+str(i)+"/"+str(size))
-        elem = sample(nb,cipher,zerobuf)
-        array.append(elem)
-    return array
 
-def retrieve_last_bit(pixel):
-	r_val = pixel[0]
-	return bin(r_val)[-1]
+def parse_payload(r: _BitReader, mac_key: bytes):
+    """Read and authenticate the payload. Returns (extension str, data bytes)."""
+    flag = r.bit()
+    if flag:
+        ext_len = _read_field(r, EXT_LEN_DIGITS)
+        if ext_len > MAX_EXT_BYTES:
+            raise HiddenDataError(_BAD_MSG)
+    else:
+        ext_len = STD_EXT_LEN
+    ext_b = r.take(ext_len)
+    size = _read_field(r, SIZE_DIGITS)
+    tag = r.take(TAG_LEN)
+    data = r.take(size)
+    if not hmac.compare_digest(tag, _mac(mac_key, flag, ext_b, data)):
+        raise HiddenDataError(_BAD_MSG)
+    try:
+        ext = ext_b.decode("utf-8")
+        _extension_bytes(ext)
+    except ValueError:
+        raise ValueError("the hidden file type contains invalid characters") from None
+    return ext, data
 
-def pos_arr_builder(img,lenmsg,cipher):
-   length = img.size[0]*img.size[1]
-   array = []
-   zerobuf = bytes([0x00]) * 5
-   for i in range(lenmsg):
-      if len(array)== 0:
-         array.append(sample(length,cipher,zerobuf))
-         length-=1
-      else:
-         e=sample(length,cipher,zerobuf)
-         for j in array:
-            if e >= j:
-               e+=1
-         length-=1
-         array.append(e)
-   return array
 
-# -- Function that modify the last bit of the red pixel value according to a bit --
-def modify_pixel(pixel, bit):
-	r_val = pixel[0]
-	rep_binaire = bin(r_val)[2:]
-	rep_bin_mod = rep_binaire[:-1] + bit
-	r_val = int(rep_bin_mod, 2)
-	return tuple([r_val] + list(pixel[1:]))
+# --------------------------------------------------------------------------
+# Hide
+# --------------------------------------------------------------------------
+def fog(key: str, message: str, image_bank: str, destination_folder: str,
+        extension: str = None, store_nonce: bool = True):
+    """Hide the file `message` in the PNGs of `image_bank`, write them to `destination_folder`.
 
-# -- Function that hide content in one images --
-def hide(image_file,binary_message,cipher):
-   image = Image.open(image_file)
-   array = pos_arr_builder(image,len(binary_message),cipher)
-   dimX,dimY = image.size
-   im = image.load()
-   i=0
-   for bit in binary_message:
-      posy_pixel, posx_pixel = divmod(array[i], dimX)
-      im[posx_pixel,posy_pixel] = modify_pixel(im[posx_pixel,posy_pixel],bit)
-      i += 1
-   return image
+    `extension` (without dot) overrides the one taken from the file name.
+    Returns (embedded_bytes, nonce_base64).
+    """
+    if os.path.realpath(image_bank) == os.path.realpath(destination_folder):
+        raise ValueError("destination folder must differ from the image bank")
 
-# -- Function that retrieve the hidden content in one images -- 
-def extract_message(image_file,size,cipher):
-   message = ""
-   image =Image.open(image_file)
-   array = pos_arr_builder(image,size,cipher)
-   dimX,dimY = image.size
-   im = image.load()
-   posx_pixel = 0
-   posy_pixel = 0
-   i=0
-   for rang_car in range(0,size):
-      rep_binaire = ""
-      posy_pixel, posx_pixel = divmod(array[i], dimX)
-      rep_binaire += retrieve_last_bit(im[posx_pixel,posy_pixel])
-      i+=1
-      message += rep_binaire
-   image.close()
-   return message
+    files = sorted(glob.glob(os.path.join(image_bank, "*.png")))
+    if not files:
+        raise FileNotFoundError(f"no .png files in {image_bank!r}")
+    images = [_normalize(Image.open(f)) for f in files]
+    order = _canonical_order(images)
+    imgset = ImageSet([images[i] for i in order])
 
-# -- Function that add the size of each images-- 
-def max_size(list):
-   size=0
-   for i in list:
-      image = Image.open(i)
-      size+=image.size[0]*image.size[1]
-      image.close()
-   return size
+    with open(message, "rb") as fh:
+        data = fh.read()
+    if extension is None:
+        extension = os.path.splitext(message)[1][1:]
+    extension = extension.lstrip(".")
 
-# -- Function that create string for each x present in a list -- 
-def smallf(x,arr,msg):
-   string =""
-   for i in range(len(arr)):
-      if arr[i] == x:
-         string+=msg[i]
-   return string
+    nonce = get_random_bytes(NONCE_LEN)
+    cipher_key, mac_key = derive_keys(key, nonce)
+    flag, body = build_payload(extension, data, mac_key)
 
-# -- Function that convert a zip to bytestring --
-def zip_to_bytestring(path):
-   tst=""
-   with open(path, "rb") as f:
-      bytes = f.read()
-      tst="".join(["{:08b}".format(x) for x in bytes])
-   return tst
+    nbits = 1 + 8 * len(body)
+    if nbits > imgset.total:
+        raise ValueError(f"message needs {nbits} bits but the images only offer "
+                         f"{imgset.total} pixels (1 bit per pixel)")
 
-# -- Function that convert a bytestring to zip --
-def bytestring_to_zip(s,path):
-   z=int(s,2).to_bytes(int(len(s)/8),byteorder="big")
-   in_memory = io.BytesIO(z)
-   data = in_memory.read()
-   with open(path+'/out.zip','wb') as out:
-      out.write(data)
+    positions = position_stream(Keystream(cipher_key, nonce), imgset.total)
+    for bit in payload_bits(flag, body):
+        imgset.write_bit(next(positions), bit)
 
-# -- Encrypting funtion -- 
-def fog(key,message,image_bank,destination_folder):
-   print("Starting encryption...\n")
+    os.makedirs(destination_folder, exist_ok=True)
+    snonce = base64.b64encode(nonce).decode("ascii")
+    for path, img in zip(files, images):
+        meta = None
+        if store_nonce:
+            meta = PngInfo()
+            meta.add_text(NONCE_KEY, snonce)
+        img.save(os.path.join(destination_folder, os.path.basename(path)),
+                 "PNG", pnginfo=meta)
 
-   # Retrieve all images
-   img_list=glob.glob(image_bank+'/*.png')
-   print("Image list : ")
-   print(img_list)
-   print()
+    return (nbits + 7) // 8, snonce
 
-   # Encode key with SHA-256
-   m = hashlib.sha256()
-   m.update(key.encode('utf-8'))
-   seed = m.digest() # use SHA-256 to hash different size seeds
 
-   # Generate a nonce according to rfc8439 (Obsoletes 7539)
-   nonce_rfc7539 = get_random_bytes(24) # XChacha20 nonce 192 bits
-   snonce = b64encode(nonce_rfc7539).decode('utf-8')
+# --------------------------------------------------------------------------
+# Extract
+# --------------------------------------------------------------------------
+def wind(key: str, directory: str, outputdirectory: str,
+         output_name: str = "out", nonce: str = None) -> str:
+    """Recover the hidden file from the PNGs in `directory`.
 
-   # --- Debug ---
-   print("Nonce : " + snonce)
-   print("Max size for message : " + str(max_size(img_list)))
-   # --- End Debug ---
+    The file is written as `<output_name>.<extension>` (no dot if it had none).
+    `nonce` (base64) is only needed when the metadata was stripped or not stored.
+    Returns the output path.
+    """
+    files = sorted(glob.glob(os.path.join(directory, "*.png")))
+    if not files:
+        raise FileNotFoundError(f"no .png files in {directory!r}")
 
-   # Generate XChacha20 python object with nonce and key 
-   cipher = ChaCha20.new(key=seed, nonce=nonce_rfc7539)
+    opened = [Image.open(f) for f in files]
+    found = {getattr(im, "text", {}).get(NONCE_KEY) for im in opened} - {None}
+    if nonce is None:
+        if not found:
+            raise ValueError("no nonce in the image metadata; pass it explicitly (--nonce)")
+        if len(found) > 1:
+            raise ValueError("images carry different nonces (not from the same hiding run)")
+        nonce = found.pop()
+    try:
+        nonce_b = base64.b64decode(nonce, validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError("nonce is not valid base64") from None
+    if len(nonce_b) != NONCE_LEN:
+        raise ValueError(f"nonce must be {NONCE_LEN} bytes")
 
-   # Retrieve all bytes of the zipfile
-   binary_message = zip_to_bytestring(message)
-   
-   # Split bytes according to the number of images
-   image_nb = safe_randrange(len(img_list), len(binary_message),cipher)
-   splitted_msg =[]
-      
-   for i in range(len(img_list)):
-      splitted_msg.append(smallf(i,image_nb,binary_message))
+    images = [_normalize(im) for im in opened]
+    order = _canonical_order(images)
+    imgset = ImageSet([images[i] for i in order])
 
-   # Hide message in picture
-   for idx,i in enumerate(img_list):
-      if splitted_msg[idx] != '':
-         image = hide(i,splitted_msg[idx],cipher)
-         savepath = image.filename
-         savepath = destination_folder+savepath[len(image_bank):]
-         metadata = PngInfo()
-         metadata.add_text("Order", str(idx))
-         metadata.add_text("Nonce", snonce)
-         image.save(savepath, "png", pnginfo=metadata)
-         image.close()
-      else:
-         image=Image.open(i)
-         metadata = PngInfo()
-         metadata.add_text("Order", str(idx))
-         metadata.add_text("Nonce", snonce)
-         savepath=image.filename
-         savepath.replace(image_bank, destination_folder)
-         savepath = destination_folder+savepath[len(image_bank):]
-         image.save(savepath, "png", pnginfo=metadata)
-         image.close()
+    cipher_key, mac_key = derive_keys(key, nonce_b)
+    positions = position_stream(Keystream(cipher_key, nonce_b), imgset.total)
+    ext, data = parse_payload(_BitReader(imgset, positions), mac_key)
 
-   # Print the binary message length for decryption
-   print("Length of binary message: " + str(len(binary_message)) +"\n")
-   return str(len(binary_message))
-	
-# -- Decrypting function -- 
-def wind(key,size,directory, outputdirectory):
-   print("Starting decryption...")
-   # Retrieve all images
-   img_list=glob.glob(directory+'/*.png')
-   print("Image list : ")
-   print(img_list)
-   print()
-   print(size)
-    
-   # Encode key with SHA-256
-   m = hashlib.sha256()
-   m.update(key.encode('utf-8'))
-   seed = m.digest()
-   print("Seed : "+ str(seed) +"\n")
-   
-   # Retrieve nonce from image metadata
-   targetImage = PngImageFile(img_list[0])
-   nonce_rfc7539 = b64decode(targetImage.text["Nonce"])
-   print("Nonce : "+ targetImage.text["Nonce"] +"\n")
+    os.makedirs(outputdirectory, exist_ok=True)
+    name = output_name + ("." + ext if ext else "")
+    out_path = os.path.join(outputdirectory, name)
+    with open(out_path, "wb") as fh:
+        fh.write(data)
+    return out_path
 
-   # Generate XChacha20 python object from nonce and key
-   cipher = ChaCha20.new(key=seed, nonce=nonce_rfc7539)
 
-   print("Length image list : "+ str(len(img_list)))
-   # Get array of picture number 
-   img_nb=safe_randrange(len(img_list),size,cipher)
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
 
-   # Split list according to images number
-   arr_size = []
-   sorted_img_list = [0]*len(img_list)
-   for i in range(len(img_list)):
-      j=0
-      targetImage = PngImageFile(img_list[i])
-      sorted_img_list[int(targetImage.text["Order"])]=img_list[i]
-      for k in img_nb:
-         if k==i:
-            j+=1
-      arr_size.append(j)
+    h = sub.add_parser("hide", help="hide a file in a set of PNGs")
+    h.add_argument("message")
+    h.add_argument("image_bank")
+    h.add_argument("destination")
+    h.add_argument("--key")
+    h.add_argument("--ext", help="file extension to record (default: from the file name)")
+    h.add_argument("--no-nonce-metadata", action="store_true",
+                   help="do not write the nonce into the PNGs (it is printed instead)")
 
-   #Retrieve content in each images
-   msg_array_unordered=[]
-   for idx,i in enumerate(sorted_img_list):
-      if arr_size[idx] != 0:
-         msg_array_unordered.append(extract_message(i,arr_size[idx],cipher))
-      else:
-         msg_array_unordered.append("")
-   bcontent=""
+    e = sub.add_parser("extract", help="recover the hidden file")
+    e.add_argument("directory")
+    e.add_argument("output_directory")
+    e.add_argument("--output-name", default="out",
+                   help="base name of the recovered file (extension is added)")
+    e.add_argument("--nonce", help="base64 nonce, if the metadata was stripped")
+    e.add_argument("--key")
 
-   # Append content of each images
-   for i in range(len(img_nb)):
-      s = msg_array_unordered[img_nb[i]]
-      bcontent+=s[0]
-      msg_array_unordered[img_nb[i]]=s[1:]
+    args = ap.parse_args(argv)
+    key = args.key or getpass.getpass("Key: ")
 
-   #Convert byte content to zip
-   bytestring_to_zip(bcontent,outputdirectory)
+    try:
+        if args.cmd == "hide":
+            n, snonce = fog(key, args.message, args.image_bank, args.destination,
+                            extension=args.ext, store_nonce=not args.no_nonce_metadata)
+            print(f"Hidden {n} bytes (including header) in {args.destination}/")
+            if args.no_nonce_metadata:
+                print(f"Nonce (keep it, needed to extract): {snonce}")
+        else:
+            path = wind(key, args.directory, args.output_directory,
+                        args.output_name, args.nonce)
+            print(f"Recovered file written to {path}")
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
-# -- Main script to assess time consumption of each function --
-# import time
-# start_time = time.time()
-# fog("key2","hello.zip","bank","fog")
-# print("--- %s seconds ---" % (time.time() - start_time))
-# print("Encryption ended successfully ! Images are stored in the 'fog' directory !")
-# inp = input("Size ? : ")
-# start_time = time.time()
-# wind("key2",int(inp),"fog",".")
-# print("--- %s seconds ---" % (time.time() - start_time))
+
+if __name__ == "__main__":
+    sys.exit(main())
