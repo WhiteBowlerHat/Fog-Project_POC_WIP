@@ -2,13 +2,55 @@
 
 Hide **any file** (zip, txt, mp4, ...) inside a bank of PNG images, at secret, key-dependent pseudo-random positions.
 
+The application can be used in two ways:
+
+| Mode | Script | Description |
+|-|-|-|
+| Graphical (GUI) | `app.py` | Desktop window (PySide6) to pick the files and folders with the mouse |
+| Console (CLI) | `fastfog.py` | Command-line tool, also usable as a Python module |
+
+Both modes use the same engine (`fog` / `wind` in `fastfog.py`), so images produced by one can be read by the other.
+
 ## Installation
+
+Console only:
 
 ```
 pip install pillow pycryptodome
 ```
 
-## Usage
+Graphical interface (adds PySide6):
+
+```
+pip install pillow pycryptodome PySide6
+```
+
+or install everything from `requirements.txt`:
+
+```
+pip install -r requirements.txt
+```
+
+## Graphical usage (`app.py`)
+
+```
+python app.py
+```
+
+The window has two parts:
+
+- **Encrypt** (hide a file):
+  1. Click **Select File** and choose the file to hide.
+  2. Choose the input folder (the bank of `.png` cover images) and the output folder (must differ from the bank).
+  3. Type the key, then click the encrypt button. The number of embedded bytes is displayed when it is done.
+- **Decrypt** (recover a file):
+  1. Choose the input folder (the images produced by the encryption) and the output folder.
+  2. Type the key. The **Nonce** field is optional: leave it empty unless the PNG metadata was stripped.
+  3. Click the decrypt button. The path of the recovered file is displayed.
+
+Errors (wrong key, missing images, message too large, ...) are shown in a dialog box.
+
+## Console usage (`fastfog.py`)
 
 ### Hide a file
 
