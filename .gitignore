@@ -4,7 +4,3 @@ venv/
 # Python cache
 __pycache__/
 *.pyc
-
-# PyInstaller output
-build/
-dist/
