@@ -35,10 +35,10 @@ Keys and image order
       --no-nonce-metadata, keep the printed nonce, and give it back with --nonce.
 
 Usage
-    python fastfog.py hide    secret.mp4 bank_dir out_dir
-                              [--key K] [--name NAME] [--ext EXT] [--no-nonce-metadata]
-    python fastfog.py extract out_dir result_dir
-                              [--key K] [--nonce B64] [--output-name NAME]
+    python -m fog hide    secret.mp4 bank_dir out_dir
+                          [--key K] [--name NAME] [--ext EXT] [--no-nonce-metadata]
+    python -m fog extract out_dir result_dir
+                          [--key K] [--nonce B64] [--output-name NAME]
 
 LSB data does not survive JPEG conversion, resizing or lossy re-encoding.
 """
@@ -457,7 +457,7 @@ def wind(key: str, directory: str, outputdirectory: str,
 # CLI
 # --------------------------------------------------------------------------
 def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap = argparse.ArgumentParser(prog="python -m fog", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     h = sub.add_parser("hide", help="hide a file in a set of PNGs")

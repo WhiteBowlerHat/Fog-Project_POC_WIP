@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QAbstractButton, QApplication, QDialog, QFrame, Q
     QLabel, QLineEdit, QPushButton, QSlider, QToolButton, QVBoxLayout, QWidget)
 from PySide6.QtCore import QTimer
 
-from i18n import tr
+from gui.i18n import tr
 
 # --- Colours ---------------------------------------------------------------
 BACKGROUND = "#19191a"   # window background

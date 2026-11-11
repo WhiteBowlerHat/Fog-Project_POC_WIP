@@ -4,12 +4,43 @@ Hide **any file** (zip, txt, mp4, ...) inside a bank of PNG images, at secret, k
 
 The application can be used in two ways:
 
-| Mode | Script | Description |
+| Mode | Command | Description |
 |-|-|-|
-| Graphical (GUI) | `app.py` | Desktop window (PySide6) to pick the files and folders with the mouse |
-| Console (CLI) | `fastfog.py` | Command-line tool, also usable as a Python module |
+| Graphical (GUI) | `python -m gui` | Desktop window (PySide6) to pick the files and folders with the mouse |
+| Console (CLI) | `python -m fog` | Command-line tool; `fog` is also usable as a Python package |
 
-Both modes use the same engine (`fog` / `wind` in `fastfog.py`), so images produced by one can be read by the other.
+Both modes use the same engine (`fog` / `wind` in `fog/fastfog.py`), so images produced by one can be read by the other.
+Run the commands from the project root.
+
+## Project structure
+
+```
+Fog-Project_POC_WIP/
+├── fog/                    # engine, no graphical dependency
+│   ├── fastfog.py          # hide / recover algorithm + command line
+│   ├── __init__.py         # exposes fog() and wind()
+│   └── __main__.py         # python -m fog
+├── gui/                    # graphical interface (PySide6)
+│   ├── app.py              # main window
+│   ├── theme.py            # dark theme, title bar, alerts, side drawers
+│   ├── tour.py             # guided tour
+│   ├── i18n.py             # English / French texts
+│   ├── paths.py            # location of the assets (sources or PyInstaller build)
+│   ├── __main__.py         # python -m gui
+│   └── ui/                 # Qt Designer file and generated code
+│       ├── first-ww.ui
+│       └── main_window_ui2.py
+├── assets/
+│   ├── logo.png
+│   ├── icon.png            # window icon
+│   └── icon.ico            # icon of the .exe
+├── packaging/
+│   ├── app.spec            # PyInstaller: pyinstaller packaging/app.spec
+│   └── version_info.txt    # version shown in the .exe properties
+├── requirements.txt
+├── LICENSE.md
+└── Readme.md
+```
 
 ## Installation
 
@@ -31,18 +62,19 @@ or install everything from `requirements.txt`:
 pip install -r requirements.txt
 ```
 
-## Graphical usage (`app.py`)
+## Graphical usage
 
 ```
-python app.py
+python -m gui
 ```
 
 The window has two parts:
 
 - **Encrypt** (hide a file):
-  1. Click **Select File** and choose the file to hide.
-  2. Choose the input folder (the bank of `.png` cover images) and the output folder (must differ from the bank).
-  3. Type the key, then click the encrypt button. The number of embedded bytes is displayed when it is done.
+  1. Type the key twice (key + confirmation).
+  2. Click **Select File** and choose the file to hide.
+  3. Choose the input folder (the bank of `.png` cover images) and the output folder (must differ from the bank).
+  4. Click the encrypt button. Only the names are shown; the folder button next to each field shows the full path.
 - **Decrypt** (recover a file):
   1. Choose the input folder (the images produced by the encryption) and the output folder.
   2. Type the key. The **Nonce** field is optional: leave it empty unless the PNG metadata was stripped.
@@ -50,12 +82,26 @@ The window has two parts:
 
 Errors (wrong key, missing images, message too large, ...) are shown in a dialog box.
 
-## Console usage (`fastfog.py`)
+## Windows executable
+
+Build a single `FogProject.exe` (no Python needed on the target computer, no console window):
+
+```
+pip install pyinstaller
+pyinstaller packaging/app.spec --noconfirm --clean
+```
+
+The file is written to `dist/FogProject.exe` (`build/` and `dist/` are ignored by git).
+The executable is not signed, so Windows SmartScreen may show a warning the first time
+("More info" > "Run anyway"). When the version changes, update `VERSION` in `gui/app.py`
+and `packaging/version_info.txt`.
+
+## Console usage
 
 ### Hide a file
 
 ```
-python fastfog.py hide message.zip bank/ output/
+python -m fog hide message.zip bank/ output/
 ```
 
 - `message.zip`: the file to hide (any type, no need to zip it).
@@ -76,7 +122,7 @@ Options:
 ### Recover a file
 
 ```
-python fastfog.py extract output/ result/
+python -m fog extract output/ result/
 ```
 
 The file is written as `result/out.<extension>` (for example `out.zip`, `out.mp4`, or just `out` if the original had no extension).
@@ -91,17 +137,11 @@ Options:
 
 ### Python
 
-The hyphen in `fastfog.py` prevents a plain `import`, so load the file explicitly (or rename it `fast_fog.py` and use `from fast_fog import fog, wind`):
-
 ```python
-import importlib.util
+from fog import fog, wind
 
-spec = importlib.util.spec_from_file_location("fast_fog", "fastfog.py")
-fast_fog = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(fast_fog)
-
-nbytes, nonce = fast_fog.fog("my key", "message.zip", "bank", "output")   # hide
-path = fast_fog.wind("my key", "output", "result")                        # recover
+nbytes, nonce = fog("my key", "message.zip", "bank", "output")   # hide
+path = wind("my key", "output", "result")                        # recover
 ```
 
 `fog(key, message, image_bank, destination, extension=None, store_nonce=True)` returns the number of embedded bytes and the nonce (base64).

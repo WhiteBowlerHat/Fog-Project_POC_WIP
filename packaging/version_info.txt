@@ -1,0 +1,28 @@
+# Windows version resource of FogProject.exe (Properties > Details).
+# Keep in sync with VERSION in gui/app.py ("Version C_0.0.1").
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(0, 0, 1, 0),
+    prodvers=(0, 0, 1, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable('040904B0', [
+        StringStruct('ProductName', 'Fog Project'),
+        StringStruct('FileDescription', 'Fog Project - hide files in PNG images'),
+        StringStruct('FileVersion', 'C_0.0.1'),
+        StringStruct('ProductVersion', 'C_0.0.1'),
+        StringStruct('InternalName', 'FogProject'),
+        StringStruct('OriginalFilename', 'FogProject.exe'),
+        StringStruct('LegalCopyright', 'See LICENSE.md')
+      ])
+    ]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)

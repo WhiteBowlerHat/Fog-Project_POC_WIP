@@ -6,12 +6,13 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QLabel,
     QLineEdit, QVBoxLayout, QWidget)
 
-from main_window_ui2 import Ui_Fog
-from fastfog import fog, wind
-from i18n import LANGUAGES, language, set_language, tr
-from theme import (IconButton, LoadingOverlay, PasswordToggle, SideDrawer, TitleBar,
+from gui.ui.main_window_ui2 import Ui_Fog
+from fog import fog, wind
+from gui.i18n import LANGUAGES, language, set_language, tr
+from gui.theme import (IconButton, LoadingOverlay, PasswordToggle, SideDrawer, TitleBar,
     ToggleSlider, alert, apply_theme, confirm, make_icon, tinted_pixmap)
-from tour import Step, TourOverlay
+from gui.paths import ICON, LOGO
+from gui.tour import Step, TourOverlay
 
 REPO_URL = "https://github.com/WhiteBowlerHat/Fog-Project_POC_WIP"
 VERSION = "Version C_0.0.1"   # C = computer; never translated
@@ -25,7 +26,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_Fog):
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint
                             | Qt.WindowMinMaxButtonsHint | Qt.WindowSystemMenuHint)
         self.setWindowTitle("Fog Project")
-        self.setWindowIcon(QIcon("logo.png"))
+        self.setWindowIcon(QIcon(ICON))
 
         # Root = banner + body. The generated UI is drawn in a fixed-size `content`
         # widget, centered in the body (so maximizing keeps it in the middle).
@@ -36,7 +37,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_Fog):
         root_layout = QVBoxLayout(self.root)
         root_layout.setContentsMargins(1, 1, 1, 1)
         root_layout.setSpacing(0)
-        self.titlebar = TitleBar(self, "Fog Project", logo="logo.png")
+        self.titlebar = TitleBar(self, "Fog Project", logo=LOGO)
         root_layout.addWidget(self.titlebar)
 
         self.body = body = QWidget()
@@ -52,7 +53,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_Fog):
         # White logo (smaller), aspect ratio kept, with an italic tagline
         self.label.setScaledContents(False)
         self.label.setGeometry(QRect(321, 16, 210, 73))
-        self.label.setPixmap(tinted_pixmap("logo.png").scaled(
+        self.label.setPixmap(tinted_pixmap(LOGO).scaled(
             210, 73, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         self.label.setAlignment(Qt.AlignCenter)
         self.Tagline = QLabel(content)
@@ -407,9 +408,17 @@ class MainWindow(QtWidgets.QMainWindow, Ui_Fog):
         alert(self, "info", tr("recovered", path=path), selectable=True)
 
 
-if __name__ == "__main__":
+def main():
+    if sys.platform == "win32":
+        # own taskbar identity (Fog icon instead of the Python one)
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("FogProject.Fog")
     app = QtWidgets.QApplication(sys.argv)
     apply_theme(app)
     window = MainWindow()
     window.show()
-    app.exec()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

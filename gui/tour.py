@@ -12,7 +12,7 @@ from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
-from i18n import tr
+from gui.i18n import tr
 
 MASK = QColor(0, 0, 0, 185)
 WHITE = QColor("#ffffff")
