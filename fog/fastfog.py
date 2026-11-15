@@ -46,6 +46,7 @@ import argparse
 import base64
 import binascii
 import bisect
+import functools
 import getpass
 import glob
 import hashlib
@@ -57,7 +58,7 @@ import sys
 
 from Crypto.Cipher import ChaCha20
 from Crypto.Random import get_random_bytes
-from PIL import Image
+from PIL import Image, ImageOps
 from PIL.PngImagePlugin import PngInfo
 
 NONCE_LEN = 24            # 192-bit nonce -> XChaCha20
@@ -76,6 +77,66 @@ _BAD_EXT_CHARS = set('/\\:*?"<>|')
 
 class HiddenDataError(ValueError):
     """Raised when nothing valid can be read with this key and image set."""
+
+
+# Images of any size are accepted: Pillow's "decompression bomb" guard is turned
+# off for the images given by the user. Very large images only get a warning
+# (large_images): they need a lot of memory and time.
+Image.MAX_IMAGE_PIXELS = None
+LARGE_IMAGE_PIXELS = 89_478_485   # Pillow's default limit, about 9460 x 9460
+BYTES_PER_PIXEL = 4               # RGBA in memory, for the memory estimate
+
+# Input formats. PNG is the native one; the others can be used for hiding when
+# they are allowed (`extensions`): they are decoded and the output is PNG.
+NATIVE_EXTENSIONS = (".png",)
+CONVERTIBLE_FORMATS = {
+    "jpg": (".jpg", ".jpeg"),
+    "tiff": (".tif", ".tiff"),
+    "bmp": (".bmp",),
+    "webp": (".webp",),
+}
+
+_MEMORY_MSG = ("not enough memory to process these images (some are very large): "
+               "use smaller or fewer images")
+
+
+def open_image(path: str) -> Image.Image:
+    """Image.open (OSError / UnidentifiedImageError if the file is unreadable)."""
+    return Image.open(path)
+
+
+def image_size(path: str):
+    """(width, height) of `path`, reading only the header."""
+    with open_image(path) as im:
+        return im.size
+
+
+def check_image(path: str) -> int:
+    """Number of pixels of `path` (header only); OSError if it cannot be read."""
+    w, h = image_size(path)
+    return w * h
+
+
+def large_images(image_bank, extensions=NATIVE_EXTENSIONS):
+    """[(file, (width, height))] of the images of `image_bank` that are very large
+    (LARGE_IMAGE_PIXELS or more)."""
+    found = []
+    for f in collect_images(image_bank, extensions):
+        w, h = image_size(f)
+        if w * h >= LARGE_IMAGE_PIXELS:
+            found.append((f, (w, h)))
+    return found
+
+
+def _memory_guard(func):
+    """Turn a MemoryError (huge images) into a clear ValueError."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except MemoryError:
+            raise ValueError(_MEMORY_MSG) from None
+    return wrapper
 
 
 # --------------------------------------------------------------------------
@@ -160,9 +221,14 @@ def _fingerprint(img: Image.Image) -> bytes:
     return h.digest()
 
 
-def _canonical_order(images):
-    """Indices of `images` sorted by fingerprint; identical images are rejected."""
-    prints = [_fingerprint(im) for im in images]
+def _canonical_order(images, on_image=None):
+    """Indices of `images` sorted by fingerprint; identical images are rejected.
+    `on_image(i)` is called after each fingerprint (progress)."""
+    prints = []
+    for i, im in enumerate(images):
+        prints.append(_fingerprint(im))
+        if on_image:
+            on_image(i)
     if len(set(prints)) != len(prints):
         raise ValueError("two images are identical (ignoring the red LSB); "
                          "every image in the set must be unique")
@@ -254,6 +320,30 @@ def build_payload(ext: str, name: str, data: bytes, mac_key: bytes):
     return flag, b"".join(parts)
 
 
+def required_bits(message: str, extension: str = None, name: str = None) -> int:
+    """Number of bits fog() needs to hide the file `message` (same layout as
+    build_payload, computed from the file size: the file is not read)."""
+    stem, dot_ext = os.path.splitext(os.path.basename(message))
+    ext_b = _extension_bytes((dot_ext[1:] if extension is None else extension).lstrip("."))
+    name_b = _name_bytes(_clean_name(stem if name is None else name), len(ext_b))
+    size = os.path.getsize(message)
+    n = (len(ext_b)
+         + 2 + len(str(len(name_b))) + len(name_b)
+         + 2 + len(str(size)) + TAG_LEN + size)
+    if len(ext_b) != STD_EXT_LEN:
+        n += 2 + len(str(len(ext_b)))
+    return 1 + 8 * n
+
+
+def capacity_bits(image_bank, extensions=NATIVE_EXTENSIONS) -> int:
+    """Number of bits the images of `image_bank` can hold (1 bit per pixel).
+    Only the image headers are read."""
+    total = 0
+    for f in collect_images(image_bank, extensions):
+        total += check_image(f)
+    return total
+
+
 def payload_bits(flag: int, body: bytes):
     yield flag
     for byte in body:
@@ -262,8 +352,9 @@ def payload_bits(flag: int, body: bytes):
 
 
 class _BitReader:
-    def __init__(self, imgset: ImageSet, positions):
+    def __init__(self, imgset: ImageSet, positions, on_bytes=None):
         self._set = imgset
+        self._on_bytes = on_bytes      # progress: called with the number of bytes read
         self._pos = positions
         self.remaining = imgset.total
 
@@ -282,7 +373,14 @@ class _BitReader:
     def take(self, n: int) -> bytes:
         if n * 8 > self.remaining:
             raise HiddenDataError(_BAD_MSG)
-        return bytes(self.byte() for _ in range(n))
+        out = bytearray()
+        chunk = 4096
+        while len(out) < n:
+            k = min(chunk, n - len(out))
+            out += bytes(self.byte() for _ in range(k))
+            if self._on_bytes:
+                self._on_bytes(k)
+        return bytes(out)
 
 
 def _read_field(r: _BitReader, max_digits: int) -> int:
@@ -305,8 +403,9 @@ def _read_field(r: _BitReader, max_digits: int) -> int:
     return int(digits)
 
 
-def parse_payload(r: _BitReader, mac_key: bytes):
-    """Read and authenticate the payload. Returns (extension, name, data)."""
+def parse_payload(r: _BitReader, mac_key: bytes, on_size=None):
+    """Read and authenticate the payload. Returns (extension, name, data).
+    `on_size(size)` is called once the size of the hidden data is known."""
     flag = r.bit()
     if flag:
         ext_len = _read_field(r, EXT_LEN_DIGITS)
@@ -320,6 +419,8 @@ def parse_payload(r: _BitReader, mac_key: bytes):
         raise HiddenDataError(_BAD_MSG)
     name_b = r.take(name_len)
     size = _read_field(r, SIZE_DIGITS)
+    if on_size:
+        on_size(size)
     tag = r.take(TAG_LEN)
     data = r.take(size)
     if not hmac.compare_digest(tag, _mac(mac_key, flag, ext_b, name_b, data)):
@@ -337,23 +438,136 @@ def parse_payload(r: _BitReader, mac_key: bytes):
 # --------------------------------------------------------------------------
 # Hide
 # --------------------------------------------------------------------------
-def fog(key: str, message: str, image_bank: str, destination_folder: str,
-        extension: str = None, store_nonce: bool = True, name: str = None):
+def _same_path(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+
+
+_FORMAT_ALIASES = {"jpeg": "jpg", "tif": "tiff"}
+
+
+def extensions_for(formats) -> tuple:
+    """PNG + the extensions of the given convertible formats (e.g. ["jpg", "webp"]).
+    Raises ValueError for an unknown format."""
+    exts = list(NATIVE_EXTENSIONS)
+    for fmt in formats:
+        key = fmt.strip().lower().lstrip(".")
+        key = _FORMAT_ALIASES.get(key, key)
+        if key not in CONVERTIBLE_FORMATS:
+            raise ValueError(f"unknown image format: {fmt!r} "
+                             f"(possible: {', '.join(CONVERTIBLE_FORMATS)})")
+        exts += CONVERTIBLE_FORMATS[key]
+    return tuple(dict.fromkeys(exts))
+
+
+def list_images(folder: str, extensions=NATIVE_EXTENSIONS):
+    """Image files of `folder` (not recursive) whose extension is in `extensions`."""
+    return sorted(f for f in glob.glob(os.path.join(folder, "*"))
+                  if os.path.isfile(f) and os.path.splitext(f)[1].lower() in extensions)
+
+
+def collect_images(sources, extensions=NATIVE_EXTENSIONS):
+    """Image files of `sources`: a folder, or a list of folders and / or image files.
+
+    Only the extensions in `extensions` are used (PNG by default). Folders give
+    their images (not recursive). A file listed twice (directly or through its
+    folder) is kept once.
+    """
+    if isinstance(sources, (str, os.PathLike)):
+        sources = [sources]
+    extensions = tuple(e.lower() for e in extensions)
+    files, seen = [], set()
+    for src in sources:
+        src = os.fspath(src)
+        if os.path.isdir(src):
+            found = list_images(src, extensions)
+        elif os.path.isfile(src) and os.path.splitext(src)[1].lower() in extensions:
+            found = [src]
+        elif os.path.isfile(src):
+            raise FileNotFoundError(f"image format not allowed (not PNG): {src!r}")
+        else:
+            raise FileNotFoundError(f"not an image or a folder: {src!r}")
+        for f in found:
+            real = os.path.normcase(os.path.realpath(f))
+            if real not in seen:
+                seen.add(real)
+                files.append(f)
+    if not files:
+        raise FileNotFoundError("no usable image in the image bank")
+    return files
+
+
+def _output_names(files):
+    """Base names for the output images, always .png (a photo.jpg gives photo.png);
+    duplicates (same name, different folders or formats) get a suffix:
+    image.png, image_2.png..."""
+    names, used = [], set()
+    for f in files:
+        stem = os.path.splitext(os.path.basename(f))[0]
+        ext = ".png"
+        out, i = stem + ext, 2
+        while out.lower() in used:
+            out, i = f"{stem}_{i}{ext}", i + 1
+        used.add(out.lower())
+        names.append(out)
+    return names
+
+
+class _Progress:
+    """Progress of fog(), as a fraction of the estimated work.
+
+    Weights measured on real runs (time per unit, relative to fingerprinting a
+    pixel): loading 3 per pixel, fingerprinting 1, writing 14 (PNG compression),
+    hiding 250 per bit (pure Python).
+    The callback gets (stage, fraction); stages: "load", "prepare", "embed", "save".
+    It may raise an exception to cancel (fog writes nothing before "save").
+    """
+    WEIGHTS = {"load": 3, "prepare": 1, "embed": 250, "save": 14}
+
+    def __init__(self, callback, pixels, bits):
+        self.callback = callback
+        w = self.WEIGHTS
+        self.total = max(1, pixels * (w["load"] + w["prepare"] + w["save"]) + bits * w["embed"])
+        self.done = 0
+
+    def advance(self, stage, units=0):
+        self.done += units * self.WEIGHTS[stage]
+        if self.callback:
+            self.callback(stage, min(1.0, self.done / self.total))
+
+
+@_memory_guard
+def fog(key: str, message: str, image_bank, destination_folder: str,
+        extension: str = None, store_nonce: bool = True, name: str = None,
+        progress=None, extensions=NATIVE_EXTENSIONS):
     """Hide the file `message` in the PNGs of `image_bank`, write them to `destination_folder`.
 
-    The file name and extension are taken from `message` and stored in the hidden
-    data. `extension` (without dot) and `name` (without extension) override them;
-    characters invalid in file names are replaced by "_".
+    `image_bank` is a folder, or a list of folders and / or PNG files (see
+    collect_images). The file name and extension are taken from `message` and
+    stored in the hidden data. `extension` (without dot) and `name` (without
+    extension) override them; characters invalid in file names are replaced by "_".
+    `progress(stage, fraction)` is called along the way (see _Progress).
+    `extensions`: input formats allowed (see extensions_for); non-PNG images are
+    decoded (and turned upright from their EXIF orientation), the output is PNG.
     Returns (embedded_bytes, nonce_base64).
     """
-    if os.path.realpath(image_bank) == os.path.realpath(destination_folder):
-        raise ValueError("destination folder must differ from the image bank")
-
-    files = sorted(glob.glob(os.path.join(image_bank, "*.png")))
-    if not files:
-        raise FileNotFoundError(f"no .png files in {image_bank!r}")
-    images = [_normalize(Image.open(f)) for f in files]
-    order = _canonical_order(images)
+    files = collect_images(image_bank, extensions)
+    for f in files:
+        if _same_path(os.path.dirname(os.path.abspath(f)), destination_folder):
+            raise ValueError("destination folder must differ from the image bank "
+                             "(it would overwrite the source images)")
+    pixels = [check_image(f) for f in files]
+    tracker = _Progress(progress, sum(pixels), required_bits(message, extension, name))
+    tracker.advance("load")
+    images = []
+    for f, px in zip(files, pixels):
+        img = open_image(f)
+        if os.path.splitext(f)[1].lower() not in NATIVE_EXTENSIONS:
+            img = ImageOps.exif_transpose(img)   # photos: same orientation as displayed
+        images.append(_normalize(img))
+        tracker.advance("load", px)
+    order = _canonical_order(images, lambda i: tracker.advance("prepare", pixels[i]))
     imgset = ImageSet([images[i] for i in order])
 
     with open(message, "rb") as fh:
@@ -374,18 +588,23 @@ def fog(key: str, message: str, image_bank: str, destination_folder: str,
                          f"{imgset.total} pixels (1 bit per pixel)")
 
     positions = position_stream(Keystream(cipher_key, nonce), imgset.total)
-    for bit in payload_bits(flag, body):
+    step = max(1, nbits // 200)          # about 200 progress updates
+    for i, bit in enumerate(payload_bits(flag, body), 1):
         imgset.write_bit(next(positions), bit)
+        if i % step == 0:
+            tracker.advance("embed", step)
+    tracker.advance("embed", nbits % step)
 
+    tracker.advance("save")              # from here on, files are written
     os.makedirs(destination_folder, exist_ok=True)
     snonce = base64.b64encode(nonce).decode("ascii")
-    for path, img in zip(files, images):
+    for out_name, img, px in zip(_output_names(files), images, pixels):
         meta = None
         if store_nonce:
             meta = PngInfo()
             meta.add_text(NONCE_KEY, snonce)
-        img.save(os.path.join(destination_folder, os.path.basename(path)),
-                 "PNG", pnginfo=meta)
+        img.save(os.path.join(destination_folder, out_name), "PNG", pnginfo=meta)
+        tracker.advance("save", px)
 
     return (nbits + 7) // 8, snonce
 
@@ -410,21 +629,62 @@ def _write_unique(path: str, data: bytes) -> str:
             candidate = f"{root} ({i}){ext}"
 
 
-def wind(key: str, directory: str, outputdirectory: str,
-         output_name: str = None, nonce: str = None) -> str:
-    """Recover the hidden file from the PNGs in `directory`.
+class _WindProgress:
+    """Progress of wind(); stages: "load", "prepare", "read", "write".
+
+    The size of the hidden file is only known after its header is read (all the
+    images must be loaded first), so the bar starts with an estimate (loading
+    and ordering = PIXEL_SHARE of the work) and is re-scaled on the remaining part when
+    the size is known: it never goes backwards. Same weights as _Progress
+    (reading a bit costs about as much as hiding one).
+    """
+    WEIGHTS = {"load": 3, "prepare": 1, "read": 250 * 8, "write": 0}   # read: per byte
+    PIXEL_SHARE = 0.15   # if the hidden file is small, the bar simply jumps forward
+
+    def __init__(self, callback, pixels):
+        self.callback = callback
+        pixel_work = pixels * (self.WEIGHTS["load"] + self.WEIGHTS["prepare"])
+        self.total = max(1, int(pixel_work / self.PIXEL_SHARE))
+        self.done = 0
+        self.base, self.base_done = 0.0, 0
+
+    def fraction(self):
+        rest = max(1, self.total - self.base_done)
+        return min(1.0, self.base + (1 - self.base) * (self.done - self.base_done) / rest)
+
+    def advance(self, stage, units=0):
+        self.done += units * self.WEIGHTS[stage]
+        if self.callback:
+            self.callback(stage, self.fraction())
+
+    def set_data_size(self, nbytes):
+        self.base, self.base_done = self.fraction(), self.done
+        self.total = self.done + max(1, nbytes * self.WEIGHTS["read"])
+
+    def finish(self, stage):
+        if self.callback:
+            self.callback(stage, 1.0)
+
+
+@_memory_guard
+def wind(key: str, directory, outputdirectory: str,
+         output_name: str = None, nonce: str = None, progress=None) -> str:
+    """Recover the hidden file from the PNGs of `directory`: a folder, or a list of
+    folders and / or PNG files (see collect_images).
 
     The file is written with its original name and extension. `output_name`
     (without extension) replaces the original name; if no name was stored, "out"
     is used. An existing file is never overwritten: a number is added instead.
     `nonce` (base64) is only needed when the metadata was stripped or not stored.
+    `progress(stage, fraction)` is called along the way (see _WindProgress); it
+    may raise an exception to cancel (nothing is written before "write").
     Returns the output path.
     """
-    files = sorted(glob.glob(os.path.join(directory, "*.png")))
-    if not files:
-        raise FileNotFoundError(f"no .png files in {directory!r}")
-
-    opened = [Image.open(f) for f in files]
+    files = collect_images(directory)
+    pixels = [check_image(f) for f in files]
+    tracker = _WindProgress(progress, sum(pixels))
+    tracker.advance("load")
+    opened = [open_image(f) for f in files]   # lazy: only the headers are read here
     found = {getattr(im, "text", {}).get(NONCE_KEY) for im in opened} - {None}
     if nonce is None:
         if not found:
@@ -439,18 +699,25 @@ def wind(key: str, directory: str, outputdirectory: str,
     if len(nonce_b) != NONCE_LEN:
         raise ValueError(f"nonce must be {NONCE_LEN} bytes")
 
-    images = [_normalize(im) for im in opened]
-    order = _canonical_order(images)
+    images = []
+    for im, px in zip(opened, pixels):
+        images.append(_normalize(im))
+        tracker.advance("load", px)
+    order = _canonical_order(images, lambda i: tracker.advance("prepare", pixels[i]))
     imgset = ImageSet([images[i] for i in order])
 
     cipher_key, mac_key = derive_keys(key, nonce_b)
     positions = position_stream(Keystream(cipher_key, nonce_b), imgset.total)
-    ext, name, data = parse_payload(_BitReader(imgset, positions), mac_key)
+    reader = _BitReader(imgset, positions, on_bytes=lambda n: tracker.advance("read", n))
+    ext, name, data = parse_payload(reader, mac_key, on_size=tracker.set_data_size)
 
+    tracker.advance("write")             # from here on, the file is written
     os.makedirs(outputdirectory, exist_ok=True)
     base = output_name if output_name is not None else (name or "out")
     filename = base + ("." + ext if ext else "")
-    return _write_unique(os.path.join(outputdirectory, filename), data)
+    path = _write_unique(os.path.join(outputdirectory, filename), data)
+    tracker.finish("write")
+    return path
 
 
 # --------------------------------------------------------------------------
@@ -462,7 +729,12 @@ def main(argv=None):
 
     h = sub.add_parser("hide", help="hide a file in a set of PNGs")
     h.add_argument("message")
-    h.add_argument("image_bank")
+    h.add_argument("image_bank", help="folder of PNG images, or one PNG image")
+    h.add_argument("--add", action="append", default=[], metavar="SOURCE",
+                   help="another folder or PNG image for the bank (repeatable)")
+    h.add_argument("--convert", default="", metavar="FORMATS",
+                   help="also use these image formats, converted to PNG: "
+                        + ",".join(CONVERTIBLE_FORMATS) + " (e.g. --convert jpg,webp)")
     h.add_argument("destination")
     h.add_argument("--key")
     h.add_argument("--name", help="file name (without extension) to record (default: from the file)")
@@ -471,7 +743,9 @@ def main(argv=None):
                    help="do not write the nonce into the PNGs (it is printed instead)")
 
     e = sub.add_parser("extract", help="recover the hidden file")
-    e.add_argument("directory")
+    e.add_argument("directory", help="folder of the produced PNG images, or one PNG image")
+    e.add_argument("--add", action="append", default=[], metavar="SOURCE",
+                   help="another folder or PNG image of the set (repeatable)")
     e.add_argument("output_directory")
     e.add_argument("--output-name",
                    help="name (without extension) to use instead of the original file name")
@@ -483,17 +757,23 @@ def main(argv=None):
 
     try:
         if args.cmd == "hide":
-            n, snonce = fog(key, args.message, args.image_bank, args.destination,
+            exts = extensions_for(f for f in args.convert.split(",") if f.strip())
+            for f, (w, h) in large_images([args.image_bank, *args.add], exts):
+                print(f"Warning: {os.path.basename(f)} is very large ({w} x {h} pixels): "
+                      f"it needs at least {w * h * BYTES_PER_PIXEL / 2**30:.1f} GB of memory "
+                      f"and can be slow.", file=sys.stderr)
+            n, snonce = fog(key, args.message, [args.image_bank, *args.add], args.destination,
+                            extensions=exts,
                             extension=args.ext, store_nonce=not args.no_nonce_metadata,
                             name=args.name)
             print(f"Hidden {n} bytes (including header) in {args.destination}/")
             if args.no_nonce_metadata:
                 print(f"Nonce (keep it, needed to extract): {snonce}")
         else:
-            path = wind(key, args.directory, args.output_directory,
+            path = wind(key, [args.directory, *args.add], args.output_directory,
                         args.output_name, args.nonce)
             print(f"Recovered file written to {path}")
-    except (ValueError, FileNotFoundError) as exc:
+    except (ValueError, OSError) as exc:   # OSError: missing or unreadable file
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     return 0

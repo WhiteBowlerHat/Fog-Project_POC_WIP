@@ -26,6 +26,7 @@ Fog-Project_POC_WIP/
 │   ├── tour.py             # guided tour
 │   ├── i18n.py             # English / French texts
 │   ├── paths.py            # location of the assets (sources or PyInstaller build)
+│   ├── device.py           # phone layout (--mobile)
 │   ├── __main__.py         # python -m gui
 │   └── ui/                 # Qt Designer file and generated code
 │       ├── first-ww.ui
@@ -73,14 +74,33 @@ The window has two parts:
 - **Encrypt** (hide a file):
   1. Type the key twice (key + confirmation).
   2. Click **Select File** and choose the file to hide.
-  3. Choose the input folder (the bank of `.png` cover images) and the output folder (must differ from the bank).
-  4. Click the encrypt button. Only the names are shown; the folder button next to each field shows the full path.
+  3. Under **Input images**, click **Add more** to add `.png` images or folders of images (the bank of cover
+     images). The field shows the capacity (1 bit per pixel); once the file to hide is chosen, a green
+     **✓ OK** means it fits, a red value shows how much room is missing. The list button shows every source
+     with its size on disk and its capacity, and lets you remove some (or all).
+  4. Choose the output folder (it must differ from the folders of the input images).
+
+  **Non-native images** (switch under *Nonce in the metadata*): when it is on, JPG, TIFF, BMP and WEBP images can
+  be added too. They are converted to PNG during the encryption (the original files are not modified) and the
+  output images are PNG. The converted formats are chosen in **Settings > Image conversion** (all by default).
+  5. Click the encrypt button. Only the names are shown; the folder button next to each field shows the full path.
 - **Decrypt** (recover a file):
-  1. Choose the input folder (the images produced by the encryption) and the output folder.
+  1. Under **Input images**, click **Add more** to add the images produced by the encryption: one or more
+     folders and / or single PNG images (exactly those images, no more, no less). The list button shows
+     them and lets you remove some. Then choose the output folder.
   2. Type the key. The **Nonce** field is optional: leave it empty unless the PNG metadata was stripped.
   3. Click the decrypt button. The path of the recovered file is displayed.
 
 Errors (wrong key, missing images, message too large, ...) are shown in a dialog box.
+
+## Phone layout
+
+```
+python -m gui --mobile
+```
+
+The window takes the size of a phone screen (Pixel 7, 412 × 915) and switches to a one-column layout: two buttons
+at the top choose **Encrypt** or **Decrypt**, the rest works the same way.
 
 ## Windows executable
 
@@ -116,6 +136,8 @@ Options:
 | Option | Effect |
 |-|-|
 | `--key KEY` | Give the key on the command line instead of the prompt |
+| `--add SOURCE` | Add another folder or PNG image to the bank (repeatable): `--add more_images/ --add photo.png` |
+| `--convert FORMATS` | Also use these image formats, converted to PNG: `jpg`, `tiff`, `bmp`, `webp` (e.g. `--convert jpg,webp`) |
 | `--ext EXT` | Record this extension instead of the one in the file name |
 | `--no-nonce-metadata` | Do not write the nonce in the PNG metadata; it is printed instead (see below) |
 
@@ -132,6 +154,7 @@ Options:
 | Option | Effect |
 |-|-|
 | `--key KEY` | Give the key on the command line instead of the prompt |
+| `--add SOURCE` | Another folder or PNG image of the set (repeatable), if the images are not all in one folder |
 | `--nonce B64` | Nonce to use when the metadata was stripped or not stored |
 | `--output-name NAME` | Base name of the recovered file (default: `out`) |
 
@@ -144,8 +167,8 @@ nbytes, nonce = fog("my key", "message.zip", "bank", "output")   # hide
 path = wind("my key", "output", "result")                        # recover
 ```
 
-`fog(key, message, image_bank, destination, extension=None, store_nonce=True)` returns the number of embedded bytes and the nonce (base64).
-`wind(key, directory, outputdirectory, output_name="out", nonce=None)` returns the path of the recovered file.
+`fog(key, message, image_bank, destination, extension=None, store_nonce=True)` (`image_bank`: a folder, or a list of folders and / or PNG files) returns the number of embedded bytes and the nonce (base64).
+`wind(key, directory, outputdirectory, output_name="out", nonce=None)` (`directory`: a folder, or a list of folders and / or PNG files) returns the path of the recovered file.
 
 ## Warnings
 
@@ -154,6 +177,9 @@ path = wind("my key", "output", "result")                        # recover
 - **Metadata can be stripped by some platforms** (messengers, social networks). If that is a risk, hide with `--no-nonce-metadata`, keep the printed nonce, and give it to `extract` with `--nonce`. Without the nonce the message cannot be recovered.
 - **Capacity is 1 bit per pixel**, minus a fixed overhead of a little over 22 bytes (type, size, authentication tag). The program stops with an error if the message does not fit.
 - **Choose a long passphrase.** The key is the only secret.
+- **Very large images are accepted but costly.** Images of about 89 million pixels or more (≈ 9460 × 9460) are
+  flagged with a warning (⚠ in the GUI, `Warning:` in the console): they need a lot of memory (about 4 bytes per
+  pixel) and time. If memory runs out, the program stops with a clear error instead of crashing.
 
 ## Objectives
 

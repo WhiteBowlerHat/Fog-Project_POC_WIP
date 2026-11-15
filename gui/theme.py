@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (QAbstractButton, QApplication, QDialog, QFrame, Q
     QLabel, QLineEdit, QPushButton, QSlider, QToolButton, QVBoxLayout, QWidget)
 from PySide6.QtCore import QTimer
 
+from gui.device import fit_width
 from gui.i18n import tr
 
 # --- Colours ---------------------------------------------------------------
@@ -29,6 +30,7 @@ ACCENT_HOVER = "#7190ff"
 ACCENT_PRESSED = "#4a68dc"
 WARNING = "#d9a441"
 ERROR = "#e05555"
+SUCCESS = "#4cc38a"
 TEXT = "#ffffff"
 CLOSE_HOVER = "#e81123"
 
@@ -105,8 +107,52 @@ QLineEdit QToolButton:hover {{ background: {BUTTON_HOVER}; border-radius: 4px; }
 }}
 #DrawerOption:hover {{ border-color: {BORDER_HOVER}; }}
 #DrawerOption[selected="true"] {{ border-color: {ACCENT}; font-weight: 600; }}
+#DrawerToggle {{ background: {FIELD}; border: 1px solid {BORDER}; border-radius: 6px; }}
+#DrawerToggle:hover {{ border-color: {BORDER_HOVER}; }}
 #LoadingCard {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 12px; }}
 #LoadingText {{ font-size: 11pt; font-weight: 600; }}
+
+/* Progress of the encryption */
+QProgressBar {{
+    background: {FIELD}; border: 1px solid {BORDER}; border-radius: 6px;
+    text-align: center; font-weight: 600;
+}}
+QProgressBar::chunk {{ background: {ACCENT}; border-radius: 5px; }}
+
+/* Input images field: capacity + green / red indicator */
+#InfoField {{ background: #151517; border: 1px solid {BORDER}; border-radius: 6px; }}
+#InfoField:hover {{ border-color: {BORDER_HOVER}; }}
+#InfoText[empty="true"] {{ color: rgba(255, 255, 255, 115); }}
+#InfoState {{ font-weight: 600; }}
+#InfoState[state="ok"] {{ color: {SUCCESS}; }}
+#InfoState[state="missing"] {{ color: {ERROR}; }}
+
+/* Input images dialog */
+#SourceRow {{ background: {FIELD}; border: 1px solid {BORDER}; border-radius: 8px; }}
+#SourceRow:hover {{ border-color: {BORDER_HOVER}; }}
+#SourceName {{ font-weight: 600; }}
+#SourcePath, #SourceCount {{ font-size: 8pt; color: rgba(255, 255, 255, 150); }}
+#SourceWarning {{ font-size: 8pt; font-weight: 600; color: {WARNING}; }}
+#SourcesSummary {{ font-size: 10pt; }}
+QScrollArea {{ background: transparent; border: none; }}
+QScrollArea > QWidget > QWidget {{ background: transparent; }}
+QPushButton[danger="true"] {{ background: transparent; border: 1px solid {ERROR}; }}
+QPushButton[danger="true"]:hover {{ background: {ERROR}; }}
+QPushButton[danger="true"]:focus {{ border-color: {ERROR}; }}
+QPushButton:disabled {{ color: rgba(255, 255, 255, 90); border-color: {BORDER}; background: {BUTTON}; }}
+QMenu {{ padding: 4px; }}
+QMenu::item {{ padding: 6px 18px 6px 10px; border-radius: 4px; }}
+
+/* Phone layout: [Encrypt | Decrypt] */
+#SegButton {{
+    background: {BUTTON}; border: 1px solid {BORDER}; border-radius: 0;
+    padding: 8px; font-size: 10pt; font-weight: 600;
+}}
+#SegButton[side="left"] {{ border-top-left-radius: 8px; border-bottom-left-radius: 8px; }}
+#SegButton[side="right"] {{ border-top-right-radius: 8px; border-bottom-right-radius: 8px; }}
+#SegButton:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
+#SegButton:focus {{ border-color: {BORDER}; }}
+#SegButton:checked:focus {{ border-color: {ACCENT}; }}
 
 /* Tagline under the logo, software version */
 #Tagline {{ font-size: 10pt; font-style: italic; color: rgba(255, 255, 255, 190); }}
@@ -140,14 +186,14 @@ QPushButton:focus {{ border-color: {ACCENT}; }}
 
 /* Toggle slider */
 QSlider#ToggleSlider::groove:horizontal {{
-    height: 20px; border-radius: 10px; background: #3a3a41;
+    height: 16px; border-radius: 8px; background: #3a3a41;
 }}
 QSlider#ToggleSlider[on="true"]::groove:horizontal {{ background: {ACCENT}; }}
 QSlider#ToggleSlider::sub-page:horizontal, QSlider#ToggleSlider::add-page:horizontal {{
     background: transparent;
 }}
 QSlider#ToggleSlider::handle:horizontal {{
-    background: {TEXT}; width: 16px; height: 16px; margin: 2px; border-radius: 8px;
+    background: {TEXT}; width: 12px; height: 12px; margin: 2px; border-radius: 6px;
 }}
 
 /* Alerts */
@@ -274,6 +320,31 @@ def draw_icon(p: QPainter, kind: str, c: QPointF, color: str = TEXT):
         p.drawPolyline([QPointF(x - 5, y), QPointF(x - 1.5, y + 4), QPointF(x + 5.5, y - 4)])
     elif kind == "blank":
         pass
+    elif kind == "image":
+        p.setPen(QPen(QColor(color), 1.4))
+        p.drawRoundedRect(QRectF(x - 8, y - 6.5, 16, 13), 2, 2)
+        p.drawPolyline([QPointF(x - 6, y + 4), QPointF(x - 2, y - 0.5), QPointF(x + 1, y + 2.5),
+                        QPointF(x + 3, y + 0.5), QPointF(x + 6, y + 4)])
+        p.setBrush(QColor(color))
+        p.drawEllipse(QPointF(x + 3.5, y - 3), 1.4, 1.4)
+    elif kind == "trash":
+        p.setPen(QPen(QColor(color), 1.4))
+        p.drawLine(QPointF(x - 7, y - 5), QPointF(x + 7, y - 5))
+        p.drawPolyline([QPointF(x - 2.5, y - 5), QPointF(x - 2.5, y - 7.5),
+                        QPointF(x + 2.5, y - 7.5), QPointF(x + 2.5, y - 5)])
+        p.drawPolyline([QPointF(x - 5.5, y - 5), QPointF(x - 4.5, y + 7.5),
+                        QPointF(x + 4.5, y + 7.5), QPointF(x + 5.5, y - 5)])
+        p.drawLine(QPointF(x - 1.5, y - 2), QPointF(x - 1.5, y + 5))
+        p.drawLine(QPointF(x + 1.5, y - 2), QPointF(x + 1.5, y + 5))
+    elif kind == "plus":
+        p.setPen(QPen(QColor(color), 1.6))
+        p.drawLine(QPointF(x - 6, y), QPointF(x + 6, y))
+        p.drawLine(QPointF(x, y - 6), QPointF(x, y + 6))
+    elif kind == "list":
+        p.setPen(QPen(QColor(color), 1.5))
+        for dy in (-5, 0, 5):
+            p.drawLine(QPointF(x - 3, y + dy), QPointF(x + 8, y + dy))
+            p.drawPoint(QPointF(x - 7, y + dy))
     elif kind == "folder":
         p.setPen(QPen(QColor(color), 1.4))
         folder = QPainterPath()
@@ -441,7 +512,7 @@ class ToggleSlider(QSlider):
         self.setObjectName("ToggleSlider")
         self.setRange(0, 1)
         self.setPageStep(1)
-        self.setFixedSize(44, 22)
+        self.setFixedSize(36, 18)
         self.setCursor(Qt.PointingHandCursor)
         self.valueChanged.connect(self._update_style)
         self._update_style()
@@ -528,8 +599,8 @@ class ThemedDialog(QDialog):
         label = QLabel(text)
         label.setObjectName("DialogText")
         label.setWordWrap(True)
-        label.setMinimumWidth(440 if rich else 320)
-        label.setMaximumWidth(480)
+        label.setMinimumWidth(fit_width(440 if rich else 320, margin=110))
+        label.setMaximumWidth(fit_width(480, margin=110))
         if rich:
             label.setTextFormat(Qt.RichText)
             label.setOpenExternalLinks(True)
@@ -650,6 +721,27 @@ class SideDrawer(QFrame):
         btn.clicked.connect(slot)
         self._lay.addWidget(btn)
         return btn
+
+    def add_toggle(self, text, checked, slot):
+        """Sub-row with a label and a switch (e.g. a format to convert).
+        `slot(on: bool)` is called when the switch changes. Returns (row, label, switch)."""
+        row = QWidget()
+        outer = QHBoxLayout(row)
+        outer.setContentsMargins(28, 0, 0, 0)
+        frame = QFrame()
+        frame.setObjectName("DrawerToggle")
+        frame.setAttribute(Qt.WA_StyledBackground)
+        inner = QHBoxLayout(frame)
+        inner.setContentsMargins(10, 6, 8, 6)
+        label = QLabel(text)
+        switch = ToggleSlider()
+        switch.setValue(1 if checked else 0)
+        switch.valueChanged.connect(lambda v: slot(v == 1))
+        inner.addWidget(label, 1)
+        inner.addWidget(switch)
+        outer.addWidget(frame)
+        self._lay.addWidget(row)
+        return row, label, switch
 
     def set_title(self, title):
         self.title_label.setText(title)

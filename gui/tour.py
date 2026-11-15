@@ -28,14 +28,16 @@ class Step:
     title: str
     text: str
     side: str = "auto"              # where the bubble goes: auto, left, right
+    panel: str = None               # phone layout: panel to show for this step
 
 
 class TourOverlay(QWidget):
-    def __init__(self, host: QWidget, steps: List[Step], on_finish=None):
+    def __init__(self, host: QWidget, steps: List[Step], on_finish=None, on_step=None):
         super().__init__(host)
         self.host = host
         self.steps = steps
         self.on_finish = on_finish
+        self.on_step = on_step          # called with each step before it is shown
         self.index = 0
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)
@@ -44,7 +46,7 @@ class TourOverlay(QWidget):
         self.bubble = QFrame(self)
         self.bubble.setObjectName("TourBubble")
         self.bubble.setAttribute(Qt.WA_StyledBackground)
-        self.bubble.setFixedWidth(BUBBLE_WIDTH)
+        self.bubble.setFixedWidth(min(BUBBLE_WIDTH, max(200, host.width() - 2 * MARGIN)))
         lay = QVBoxLayout(self.bubble)
         lay.setContentsMargins(16, 14, 16, 14)
         lay.setSpacing(8)
@@ -93,6 +95,8 @@ class TourOverlay(QWidget):
     def go(self, i):
         self.index = max(0, min(i, len(self.steps) - 1))
         step = self.steps[self.index]
+        if self.on_step:
+            self.on_step(step)
         self.title.setText(step.title)
         self.text.setText(step.text)
         self.counter.setText(f"{self.index + 1} / {len(self.steps)}")
@@ -138,15 +142,21 @@ class TourOverlay(QWidget):
         return hole.center().x() < self.width() / 2
 
     def layout_bubble(self):
+        self.bubble.setFixedWidth(min(BUBBLE_WIDTH, max(200, self.width() - 2 * MARGIN)))
         self.bubble.adjustSize()
         hole = self.hole()
         bw, bh = self.bubble.width(), self.bubble.height()
-        if self.bubble_on_right(hole):
-            x = hole.right() + GAP
-        else:
-            x = hole.left() - GAP - bw
+        fits_right = hole.right() + GAP + bw <= self.width() - MARGIN
+        fits_left = hole.left() - GAP - bw >= MARGIN
+        if fits_right or fits_left:   # beside the field (wide window)
+            right = self.bubble_on_right(hole) if (fits_right and fits_left) else fits_right
+            x = hole.right() + GAP if right else hole.left() - GAP - bw
+            y = hole.center().y() - bh // 2
+        else:                         # narrow screen (phone): below, or above the field
+            x = (self.width() - bw) // 2
+            below = hole.bottom() + GAP // 2
+            y = below if below + bh <= self.height() - MARGIN else hole.top() - GAP // 2 - bh
         x = max(MARGIN, min(x, self.width() - bw - MARGIN))
-        y = hole.center().y() - bh // 2
         y = max(MARGIN, min(y, self.height() - bh - MARGIN))
         self.bubble.move(x, y)
 
@@ -176,12 +186,19 @@ class TourOverlay(QWidget):
 
         # white line from the bubble to the field
         b = QRectF(self.bubble.geometry())
-        if b.left() >= hole.right():
-            start_x, end_x = b.left(), hole.right()
-        else:
-            start_x, end_x = b.right(), hole.left()
-        end_y = hole.center().y()
-        start_y = max(b.top() + 22, min(end_y, b.bottom() - 22))
+        if b.left() >= hole.right() or b.right() <= hole.left():   # beside: horizontal
+            if b.left() >= hole.right():
+                start_x, end_x = b.left(), hole.right()
+            else:
+                start_x, end_x = b.right(), hole.left()
+            end_y = hole.center().y()
+            start_y = max(b.top() + 22, min(end_y, b.bottom() - 22))
+        else:                                                       # above / below: vertical
+            end_x = start_x = max(b.left() + 22, min(hole.center().x(), b.right() - 22))
+            if b.top() >= hole.bottom():
+                start_y, end_y = b.top(), hole.bottom()
+            else:
+                start_y, end_y = b.bottom(), hole.top()
         start, end = QPointF(start_x, start_y), QPointF(end_x, end_y)
         p.setPen(QPen(WHITE, 2))
         p.drawLine(start, end)

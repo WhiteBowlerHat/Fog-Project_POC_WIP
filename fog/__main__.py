@@ -1,4 +1,6 @@
 """Command line: python -m fog hide|extract ..."""
+import sys
+
 from fog.fastfog import main
 
-main()
+sys.exit(main())
